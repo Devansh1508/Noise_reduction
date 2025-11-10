@@ -262,6 +262,6 @@
 #     - Laptop opens: `http://localhost:8501` or same network URL
 #     """)
 
-# # Footer
+# Footer
 # st.write("---")
 # st.caption(f"💡 Network IP: {local_ip}:8501 | Device Role: {st.session_state.role or 'Not Selected'}")
