@@ -19,14 +19,26 @@ from collections import deque
 from aiohttp import web
 import aiohttp
 import socket
+import io
+import soundfile as sf
+import torch
 
 # DeepFilterNet
 try:
     from df.enhance import enhance, init_df
+    print("🔄 Loading DeepFilterNet...")
+    df_model, df_state, _ = init_df()
+    df_model = df_model.to("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     DEEPFILTER_AVAILABLE = True
-except ImportError:
-    print("⚠️  DeepFilterNet not found - running in passthrough mode")
+    print(f"✅ DeepFilterNet ready on: {DEVICE}")
+except Exception as e:
+    print("❌ DeepFilterNet not available:", e)
+    df_model = None
+    df_state = None
+    DEVICE = "cpu"
     DEEPFILTER_AVAILABLE = False
+
 
 # ============== CONFIG ==============
 PORT = 8080
@@ -388,14 +400,32 @@ def process_audio(audio_bytes):
     if df_model is None:
         return audio_bytes
     
+    # try:
+    #     audio_float = audio.astype(np.float32) / 32768.0
+    #     enhanced = enhance(df_model, df_state, audio_float)
+    #     return (enhanced * 32768).astype(np.int16).tobytes()
+    # except Exception as e:
+    #     print(f"⚠️ Processing error: {e}")
+    #     return audio_bytes
+    
+    #New
     try:
-        audio_float = audio.astype(np.float32) / 32768.0
-        enhanced = enhance(df_model, df_state, audio_float)
-        return (enhanced * 32768).astype(np.int16).tobytes()
-    except Exception as e:
-        print(f"⚠️ Processing error: {e}")
-        return audio_bytes
+        audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
 
+        audio_tensor = torch.from_numpy(audio).float().to(DEVICE)
+        if audio_tensor.ndim == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+
+        enhanced = enhance(df_model, df_state, audio_tensor)
+        enhanced_np = enhanced.squeeze().detach().cpu().numpy()
+
+        out_int16 = (enhanced_np * 32768).astype(np.int16)
+        return out_int16.tobytes()
+
+    except Exception as e:
+        print("❌ WS audio processing error:", e)
+        return audio_bytes
+    
 async def websocket_handler(request):
     """Handle WebSocket connections via aiohttp"""
     ws = web.WebSocketResponse()
@@ -471,6 +501,66 @@ def get_local_ip():
     except:
         return "127.0.0.1"
 
+
+# ==============================
+#    FILE UPLOAD ENDPOINT
+# ==============================
+async def process_upload_handler(request):
+    reader = await request.multipart()
+    field = await reader.next()
+
+    if not field or field.name != "file":
+        return web.json_response({"error": "File field required"}, status=400)
+
+    filename = field.filename
+    file_bytes = await field.read()
+
+    # Load WAV
+    data, sr = sf.read(io.BytesIO(file_bytes))
+    if data.ndim > 1:
+        data = data[:, 0]
+
+    if not DEEPFILTER_AVAILABLE:
+        clean = data
+    else:
+        audio_tensor = torch.from_numpy(data.astype(np.float32)).to(DEVICE)
+        if audio_tensor.ndim == 1:
+            audio_tensor = audio_tensor.unsqueeze(0)
+
+        enhanced = enhance(df_model, df_state, audio_tensor)
+        clean = enhanced.squeeze().detach().cpu().numpy()
+
+    # Write output WAV
+    buf = io.BytesIO()
+    sf.write(buf, clean, sr, format="WAV")
+    buf.seek(0)
+
+    return web.Response(
+        body=buf.read(),
+        headers={
+            "Content-Type": "audio/wav",
+            "Content-Disposition": f"attachment; filename=cleaned_{filename}"
+        }
+    )
+
+
+
+# Add this to server.py before app.router.add_post(...)
+from aiohttp_middlewares import cors_middleware
+
+# Or simpler:
+from aiohttp import web
+from aiohttp.web_middlewares import middleware
+
+@middleware
+async def cors_handler(request, handler):
+    resp = await handler(request)
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    return resp
+
+app = web.Application(middlewares=[cors_handler])
+
+
 async def main():
     print("=" * 50)
     print("   DeepFilterNet Single-Port Server")
@@ -480,11 +570,16 @@ async def main():
     init_deepfilter()
     
     # Create aiohttp app
-    app = web.Application()
+    # app = web.Application()
+    app = web.Application(middlewares=[cors_handler])
+
     app.router.add_get('/', index_handler)
     app.router.add_get('/ws', websocket_handler)
     app.router.add_get('/health', health_handler)
     
+    # NEW — upload endpoint
+    app.router.add_post('/process', process_upload_handler)
+
     # Start server
     runner = web.AppRunner(app)
     await runner.setup()
